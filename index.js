@@ -131,10 +131,28 @@ async function handleStart(centerId, token, chatId, from) {
 }
 
 async function handleAuthPhone(centerId, token, chatId, phone, from) {
-  const cleaned = phone.replace(/[^\d+]/g, '');
+  let cleaned = phone.replace(/[^\d+]/g, '');
+
+  // Uzbek nomer format qo'llash
+  if (cleaned.startsWith('998') && !cleaned.startsWith('+')) {
+    cleaned = '+' + cleaned;
+  } else if (cleaned.startsWith('8') && cleaned.length === 12) {
+    // 8 99 XXX XX XX -> +998 99 XXX XX XX
+    cleaned = '+998' + cleaned.substring(1);
+  } else if (cleaned.startsWith('8') && cleaned.length === 11) {
+    // 8 9X XXX XX XX (11 digits) -> +998 9X XXX XX XX
+    cleaned = '+998' + cleaned.substring(1);
+  } else if (cleaned.startsWith('+') && cleaned.length === 12) {
+    // +9989XXXXXXX (12 chars, missing last digit)
+    // Aslida +998 XX XXX XX XX = 13 chars, shuning uchun bu holatda hech narsa qilmaymiz
+  } else if (cleaned.length === 9) {
+    // Faqat 9 raqam (masalan 901234567) -> +998901234567
+    cleaned = '+998' + cleaned;
+  }
+
   if (!cleaned.match(/^\+?\d{9,15}$/)) {
     await sendMsg(token, chatId,
-      `Noto'g'ri format. Iltimos, telefon raqamingizni to'g'ri kiriting.\nMasalan: <code>+998901234567</code>`,
+      `Noto'g'ri format. Iltimos, telefon raqamingizni to'g'ri kiriting.\nMasalan: <code>+998901234567</code> yoki <code>998901234567</code>`,
       phoneKb()
     );
     return;
@@ -148,14 +166,14 @@ async function handleAuthPhone(centerId, token, chatId, phone, from) {
       await sendMsg(token, chatId, `Parolingizni yuboring:`, removeKb());
     } else {
       await sendMsg(token, chatId,
-        `Siz tizimda topilmadingiz.\n\n` +
+        `❌ Siz tizimda topilmadingiz.\n\n` +
         `Iltimos, o'quv markazingizga murojaat qiling yoki qaytadan urinib ko'ring.`,
         phoneKb()
       );
     }
   } catch (err) {
     log('error', `Check phone error: ${err.message}`);
-    await sendMsg(token, chatId, `Xatolik yuz berdi. Iltimos, qaytadan /start bosing.`);
+    await sendMsg(token, chatId, `❌ Xatolik yuz berdi. Iltimos, qaytadan /start bosing.`);
     userStates.delete(chatId);
     userPhones.delete(chatId);
   }
@@ -236,21 +254,19 @@ async function showGroups(centerId, token, chatId, student) {
       return;
     }
 
-    // Send each group as a separate card
+    let msg = `📚 <b>Guruhlarim</b>\n\n`;
     for (const g of groups) {
-      const lines = [
-        `📚 <b>${g.name}</b>`,
-        g.teacher_name ? `👨‍🏫 O'qituvchi: ${g.teacher_name}` : '',
-        g.teacher_phone ? `📞 Tel: ${g.teacher_phone}` : '',
-        g.monthly_price ? `💰 Oylik: ${Number(g.monthly_price).toLocaleString()} so'm` : '',
-      ].filter(Boolean);
-      await sendMsg(token, chatId, lines.join('\n'));
+      msg += `<b>${g.name || 'N/A'}</b>\n`;
+      if (g.teacher_name) msg += `👨‍🏫 O'qituvchi: ${g.teacher_name}\n`;
+      if (g.teacher_phone) msg += `📞 Tel: ${g.teacher_phone}\n`;
+      if (g.monthly_price) msg += `💰 Oylik: ${Number(g.monthly_price).toLocaleString()} so'm\n`;
+      msg += '\n';
     }
 
-    await sendMsg(token, chatId, `Orqaga qaytish uchun tugmani bosing:`, backKb('menu_back'));
+    await sendMsg(token, chatId, msg, backKb('menu_back'));
   } catch (err) {
     log('error', `Groups error: ${err.message}`);
-    await sendMsg(token, chatId, 'Guruhlarni olishda xatolik.', backKb('menu_back'));
+    await sendMsg(token, chatId, `❌ Guruhlarni olishda xatolik: ${err.message}`, backKb('menu_back'));
   }
 }
 
@@ -330,7 +346,7 @@ async function showPayments(centerId, token, chatId, student) {
     };
 
     let msg = `💳 <b>To'lovlarim</b>\n\n`;
-    for (const p of payments) {
+    for (const p of payments.slice(0, 12)) {
       const m = monthNames[String(p.month)] || p.month;
       const statusIcon = p.status === 'paid' ? '✅' : p.status === 'partial' ? '🟡' : '❌';
       const statusText = p.status === 'paid' ? 'To\'langan' : p.status === 'partial' ? 'Qisman' : 'To\'lanmagan';
@@ -344,7 +360,7 @@ async function showPayments(centerId, token, chatId, student) {
     await sendMsg(token, chatId, msg, backKb('menu_back'));
   } catch (err) {
     log('error', `Payments error: ${err.message}`);
-    await sendMsg(token, chatId, 'To\'lovlarni olishda xatolik.', backKb('menu_back'));
+    await sendMsg(token, chatId, `❌ To'lovlarni olishda xatolik: ${err.message}`, backKb('menu_back'));
   }
 }
 
