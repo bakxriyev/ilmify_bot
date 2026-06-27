@@ -355,32 +355,50 @@ async function showAttendance(centerId, token, chatId, student) {
 
 async function showPayments(centerId, token, chatId, student) {
   try {
-    const payments = await be(centerId, `/student-payments/${student.id}`);
-    if (!payments || payments.length === 0) {
+    const data = await be(centerId, `/student-payments/${student.id}`);
+    const debts = data?.debts || [];
+    const paid = data?.paid_payments || [];
+    const totalDebt = data?.total_debt || 0;
+    const totalPaid = data?.paid_total || 0;
+
+    if (debts.length === 0 && paid.length === 0) {
       await sendMsg(token, chatId,
-        `💳 <b>To'lovlar</b>\n\nSizda hali to'lovlar mavjud emas.`,
+        `💳 <b>To'lovlar</b>\n\nSizda hali to'lov ma'lumotlari mavjud emas.`,
         backKb('menu_back')
       );
       return;
     }
 
-    const monthNames = {
-      '1': 'Yanvar', '2': 'Fevral', '3': 'Mart', '4': 'Aprel',
-      '5': 'May', '6': 'Iyun', '7': 'Iyul', '8': 'Avgust',
-      '9': 'Sentabr', '10': 'Oktabr', '11': 'Noyabr', '12': 'Dekabr',
-    };
-
     let msg = `💳 <b>To'lovlarim</b>\n\n`;
-    for (const p of payments.slice(0, 12)) {
-      const m = monthNames[String(p.month)] || p.month;
-      const statusIcon = p.status === 'paid' ? '✅' : p.status === 'partial' ? '🟡' : '❌';
-      const statusText = p.status === 'paid' ? 'To\'langan' : p.status === 'partial' ? 'Qisman' : 'To\'lanmagan';
-      msg += `${statusIcon} <b>${m} ${p.year}</b>\n`;
-      if (p.amount) msg += `   Summa: ${Number(p.amount).toLocaleString()} so'm\n`;
-      msg += `   Holat: ${statusText}\n`;
-      if (p.paid_at) msg += `   To'langan sana: ${p.paid_at}\n`;
-      msg += '\n';
+
+    if (debts.length > 0) {
+      msg += `🔴 <b>Qarzdorliklar</b>\n`;
+      for (const d of debts) {
+        const statusIcon = d.status === 'partial' ? '🟡' : '🔴';
+        const statusText = d.status === 'partial' ? 'Qisman to\'langan' : 'To\'lanmagan';
+        msg += `${statusIcon} <b>${d.month_name} ${d.year}</b>\n`;
+        msg += `   Guruh: ${d.group_name || 'N/A'}\n`;
+        msg += `   Qarz: ${Number(d.amount).toLocaleString()} so'm\n`;
+        if (d.full_amount) msg += `   To'liq summa: ${Number(d.full_amount).toLocaleString()} so'm\n`;
+        msg += `   Holat: ${statusText}\n\n`;
+      }
     }
+
+    if (paid.length > 0) {
+      msg += `✅ <b>To'langan oylar</b>\n`;
+      for (const p of paid) {
+        msg += `✅ <b>${p.month_name} ${p.year}</b>\n`;
+        msg += `   Guruh: ${p.group_name || 'N/A'}\n`;
+        msg += `   Summa: ${Number(p.amount).toLocaleString()} so'm\n`;
+        if (p.paid_at) msg += `   Sana: ${p.paid_at}\n`;
+        msg += '\n';
+      }
+    }
+
+    msg += `━━━━━━━━━━━━━━━\n`;
+    if (totalPaid > 0) msg += `✅ Jami to'lov: ${Number(totalPaid).toLocaleString()} so'm\n`;
+    if (totalDebt > 0) msg += `🔴 Jami qarz: ${Number(totalDebt).toLocaleString()} so'm\n`;
+
     await sendMsg(token, chatId, msg, backKb('menu_back'));
   } catch (err) {
     log('error', `Payments error: ${err.message}`);
