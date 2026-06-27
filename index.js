@@ -1,16 +1,33 @@
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 
 const BACKEND_URL = process.env.BACKEND_URL || 'https://api.ilmify-edu.uz';
-const POLL_INTERVAL = 3000;
 const API_TIMEOUT = 15000;
+const POLL_TIMEOUT = 35000;
+const CONFIG_REFRESH_MS = 5 * 60 * 1000;
+const STALE_THRESHOLD_MS = 60 * 60 * 1000;
+const STATE_CLEANUP_MS = 10 * 60 * 1000;
+const MAX_PASSWORD_ATTEMPTS = 5;
+const PASSWORD_BLOCK_MS = 15 * 60 * 1000;
 
-// ─── State ─────────────────────────────────────────────────
+// Keep-alive agents
+const keepAliveAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 10000, maxSockets: 50 });
+const tgKeepAliveAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 10000, maxSockets: 25 });
+
+const api = axios.create({ timeout: API_TIMEOUT, httpsAgent: keepAliveAgent });
+const tgApi = axios.create({ timeout: API_TIMEOUT, httpsAgent: tgKeepAliveAgent });
+
+// State
 const bots = new Map();
-const userStates = new Map();   // chatId -> 'auth' | 'menu' | 'contact'
+const userStates = new Map();
 const userPhones = new Map();
-const userStudents = new Map(); // chatId -> { id, first_name, last_name, center_id }
+const userStudents = new Map();
+const lastActivity = new Map();
+const passwordFails = new Map();
 
-// ─── Logging ──────────────────────────────────────────────
+let activeConfigs = [];
+
 function log(level, msg, data = null) {
   const time = new Date().toISOString();
   const prefix = `[${time}] [${level.toUpperCase()}]`;
@@ -21,32 +38,35 @@ function log(level, msg, data = null) {
   }
 }
 
-// ─── HTTP helpers ─────────────────────────────────────────
+function touch(chatId) {
+  lastActivity.set(chatId, Date.now());
+}
+
+// HTTP helpers
 async function tg(method, token, payload) {
   const url = `https://api.telegram.org/bot${token}/${method}`;
-  const res = await axios.post(url, payload, { timeout: API_TIMEOUT });
+  const res = await tgApi.post(url, payload);
   return res.data;
 }
 
 async function be(centerId, path, data = null) {
   const url = `${BACKEND_URL}/telegram-bot/${centerId}${path}`;
   if (data) {
-    return (await axios.post(url, data, { timeout: API_TIMEOUT })).data;
+    return (await api.post(url, data)).data;
   }
-  return (await axios.get(url, { timeout: API_TIMEOUT })).data;
+  return (await api.get(url)).data;
 }
 
-async function fetchActiveBots() {
+async function refreshConfigs() {
   try {
-    const res = await axios.get(`${BACKEND_URL}/telegram-bot/active-configs`, { timeout: API_TIMEOUT });
-    return res.data || [];
+    const res = await api.get(`${BACKEND_URL}/telegram-bot/active-configs`);
+    activeConfigs = res.data || [];
   } catch (err) {
-    log('error', `Failed to fetch active bots: ${err.message}`);
-    return [];
+    log('error', `Failed to fetch active configs: ${err.message}`);
   }
 }
 
-// ─── Telegram message builders ────────────────────────────
+// Telegram helpers
 function sendMsg(token, chatId, text, kb = null) {
   const payload = { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true };
   if (kb) payload.reply_markup = kb;
@@ -78,7 +98,6 @@ function phoneKb() {
   };
 }
 
-// ─── Menus ─────────────────────────────────────────────────
 function mainMenuKb() {
   return {
     keyboard: [
@@ -102,18 +121,19 @@ function groupsBackKb() {
   ]);
 }
 
-// ─── Auth flow ─────────────────────────────────────────────
+// Auth
 async function handleStart(centerId, token, chatId, from) {
   userStates.delete(chatId);
   userPhones.delete(chatId);
   userStudents.delete(chatId);
+  passwordFails.delete(chatId);
 
-  // Check if already linked
   try {
     const status = await be(centerId, `/chat-status/${chatId}`);
     if (status.authenticated && status.student) {
       userStates.set(chatId, 'menu');
       userStudents.set(chatId, status.student);
+      touch(chatId);
       await sendMsg(token, chatId,
         `Assalomu alaykum, <b>${status.student.first_name}</b>!\n\nQuyidagi bo'limlardan birini tanlang:`,
         mainMenuKb()
@@ -123,30 +143,23 @@ async function handleStart(centerId, token, chatId, from) {
   } catch {}
 
   await sendMsg(token, chatId,
-    `Assalomu alaykum! <b>Ilmify Education</b> botiga xush kelibsiz!\n\n` +
-    `Botdan foydalanish uchun telefon raqamingizni yuboring yoki quyidagi tugmani bosing.`,
+    `Assalomu alaykum! <b>Ilmify Education</b> botiga xush kelibsiz!\n\nBotdan foydalanish uchun telefon raqamingizni yuboring yoki quyidagi tugmani bosing.`,
     phoneKb()
   );
   userStates.set(chatId, 'auth_phone');
+  touch(chatId);
 }
 
 async function handleAuthPhone(centerId, token, chatId, phone, from) {
   let cleaned = phone.replace(/[^\d+]/g, '');
 
-  // Uzbek nomer format qo'llash
   if (cleaned.startsWith('998') && !cleaned.startsWith('+')) {
     cleaned = '+' + cleaned;
   } else if (cleaned.startsWith('8') && cleaned.length === 12) {
-    // 8 99 XXX XX XX -> +998 99 XXX XX XX
     cleaned = '+998' + cleaned.substring(1);
   } else if (cleaned.startsWith('8') && cleaned.length === 11) {
-    // 8 9X XXX XX XX (11 digits) -> +998 9X XXX XX XX
     cleaned = '+998' + cleaned.substring(1);
-  } else if (cleaned.startsWith('+') && cleaned.length === 12) {
-    // +9989XXXXXXX (12 chars, missing last digit)
-    // Aslida +998 XX XXX XX XX = 13 chars, shuning uchun bu holatda hech narsa qilmaymiz
   } else if (cleaned.length === 9) {
-    // Faqat 9 raqam (masalan 901234567) -> +998901234567
     cleaned = '+998' + cleaned;
   }
 
@@ -163,17 +176,17 @@ async function handleAuthPhone(centerId, token, chatId, phone, from) {
     if (res.exists) {
       userPhones.set(chatId, cleaned);
       userStates.set(chatId, 'auth_password');
-      await sendMsg(token, chatId, `Parolingizni yuboring:`, removeKb());
+      touch(chatId);
+      await sendMsg(token, chatId, 'Parolingizni yuboring:', removeKb());
     } else {
       await sendMsg(token, chatId,
-        `❌ Siz tizimda topilmadingiz.\n\n` +
-        `Iltimos, o'quv markazingizga murojaat qiling yoki qaytadan urinib ko'ring.`,
+        `❌ Siz tizimda topilmadingiz.\n\nIltimos, o'quv markazingizga murojaat qiling yoki qaytadan urinib ko'ring.`,
         phoneKb()
       );
     }
   } catch (err) {
     log('error', `Check phone error: ${err.message}`);
-    await sendMsg(token, chatId, `❌ Xatolik yuz berdi. Iltimos, qaytadan /start bosing.`);
+    await sendMsg(token, chatId, '❌ Xatolik yuz berdi. Iltimos, qaytadan /start bosing.');
     userStates.delete(chatId);
     userPhones.delete(chatId);
   }
@@ -182,49 +195,64 @@ async function handleAuthPhone(centerId, token, chatId, phone, from) {
 async function handleAuthPassword(centerId, token, chatId, password, from) {
   const phone = userPhones.get(chatId);
   if (!phone) {
-    await sendMsg(token, chatId, `Xatolik yuz berdi. Iltimos, /start bosing.`);
+    await sendMsg(token, chatId, 'Xatolik yuz berdi. Iltimos, /start bosing.');
     userStates.delete(chatId);
     return;
+  }
+
+  // Rate limit check
+  const failEntry = passwordFails.get(chatId);
+  if (failEntry) {
+    if (failEntry.count >= MAX_PASSWORD_ATTEMPTS) {
+      if (Date.now() < failEntry.blockUntil) {
+        const remaining = Math.ceil((failEntry.blockUntil - Date.now()) / 60000);
+        await sendMsg(token, chatId, `❌ Juda ko'p urinishlar. ${remaining} daqiqa kutib, keyin /start bosing.`);
+        return;
+      }
+      passwordFails.delete(chatId);
+    }
   }
 
   try {
     const res = await be(centerId, '/verify-password', { phone, password });
     if (res.success && res.student) {
+      passwordFails.delete(chatId);
       const s = res.student;
       userStudents.set(chatId, s);
       userStates.set(chatId, 'menu');
+      touch(chatId);
 
-      // Link chat to student
-      try {
-        await be(centerId, '/link-student', {
-          chat_id: chatId,
-          student_id: s.id,
-          first_name: from.first_name || '',
-          last_name: from.last_name || '',
-          username: from.username || '',
-        });
-      } catch (err) {
-        log('warn', `Link error: ${err.message}`);
-      }
+      be(centerId, '/link-student', {
+        chat_id: chatId,
+        student_id: s.id,
+        first_name: from.first_name || '',
+        last_name: from.last_name || '',
+        username: from.username || '',
+      }).catch(() => {});
 
       await sendMsg(token, chatId,
         `✅ <b>Xush kelibsiz, ${s.first_name}!</b>\n\nQuyidagi bo'limlardan birini tanlang:`,
         mainMenuKb()
       );
     } else {
-      await sendMsg(token, chatId, `❌ Parol noto'g'ri. Qaytadan urinib ko'ring.`);
+      const entry = passwordFails.get(chatId) || { count: 0, blockUntil: 0 };
+      entry.count++;
+      if (entry.count >= MAX_PASSWORD_ATTEMPTS) {
+        entry.blockUntil = Date.now() + PASSWORD_BLOCK_MS;
+      }
+      passwordFails.set(chatId, entry);
+      await sendMsg(token, chatId, '❌ Parol noto\'g\'ri. Qaytadan urinib ko\'ring.');
     }
   } catch (err) {
-    const detail = err.response ? `status=${err.response.status} data=${JSON.stringify(err.response.data).slice(0,200)}` : err.message;
+    const detail = err.response ? `status=${err.response.status}` : err.message;
     log('error', `Verify password error: ${detail}`);
-    log('error', `URL: ${BACKEND_URL}/telegram-bot/${centerId}/verify-password phone=${phone} password=${password}`);
-    await sendMsg(token, chatId, `Xatolik yuz berdi. Iltimos, /start bosing.`);
+    await sendMsg(token, chatId, 'Xatolik yuz berdi. Iltimos, /start bosing.');
     userStates.delete(chatId);
     userPhones.delete(chatId);
   }
 }
 
-// ─── Menu handlers ─────────────────────────────────────────
+// Menu handlers
 async function showProfile(centerId, token, chatId, student) {
   try {
     const s = await be(centerId, `/student-profile/${student.id}`);
@@ -262,7 +290,6 @@ async function showGroups(centerId, token, chatId, student) {
       if (g.monthly_price) msg += `💰 Oylik: ${Number(g.monthly_price).toLocaleString()} so'm\n`;
       msg += '\n';
     }
-
     await sendMsg(token, chatId, msg, backKb('menu_back'));
   } catch (err) {
     log('error', `Groups error: ${err.message}`);
@@ -281,11 +308,10 @@ async function showAttendance(centerId, token, chatId, student) {
       return;
     }
 
-    // Group by month
     const byMonth = {};
     for (const r of records) {
       if (!r.date) continue;
-      const d = r.date.slice(0, 7); // YYYY-MM
+      const d = r.date.slice(0, 7);
       if (!byMonth[d]) byMonth[d] = [];
       byMonth[d].push(r);
     }
@@ -312,7 +338,6 @@ async function showAttendance(centerId, token, chatId, student) {
       await sendMsg(token, chatId, line);
     }
 
-    // Summary
     const total = totalPresent + totalAbsent;
     const pct = total > 0 ? Math.round((totalPresent / total) * 100) : 0;
     await sendMsg(token, chatId,
@@ -356,7 +381,6 @@ async function showPayments(centerId, token, chatId, student) {
       if (p.paid_at) msg += `   To'langan sana: ${p.paid_at}\n`;
       msg += '\n';
     }
-
     await sendMsg(token, chatId, msg, backKb('menu_back'));
   } catch (err) {
     log('error', `Payments error: ${err.message}`);
@@ -382,7 +406,6 @@ async function showGrades(centerId, token, chatId, student) {
       if (d) msg += `   ${d}\n`;
       msg += '\n';
     }
-
     await sendMsg(token, chatId, msg, backKb('menu_back'));
   } catch (err) {
     log('error', `Grades error: ${err.message}`);
@@ -392,6 +415,7 @@ async function showGrades(centerId, token, chatId, student) {
 
 async function startContact(centerId, token, chatId, student) {
   userStates.set(chatId, 'contact');
+  touch(chatId);
   await sendMsg(token, chatId,
     `✉️ <b>Admin bilan bog'lanish</b>\n\n` +
     `Adminga yubormoqchi bo'lgan xabaringizni yozing.\n\n` +
@@ -411,23 +435,21 @@ async function handleContactMessage(centerId, token, chatId, text, student) {
     );
   } catch (err) {
     log('error', `Contact error: ${err.message}`);
-    await sendMsg(token, chatId, `Xatolik yuz berdi. Qaytadan urinib ko'ring.`);
+    await sendMsg(token, chatId, 'Xatolik yuz berdi. Qaytadan urinib ko\'ring.');
   }
 }
 
-// ─── Main dispatcher ──────────────────────────────────────
+// Main dispatcher
 async function handleUpdate(centerId, token, update) {
   const msg = update.message;
   const cbq = update.callback_query;
 
-  // ── Handle callback queries (inline keyboard) ──
   if (cbq) {
     const chatId = cbq.message.chat.id;
     const msgId = cbq.message.message_id;
     const data = cbq.data;
 
-    // Ack callback
-    await tg('answerCallbackQuery', token, { callback_query_id: cbq.id });
+    tg('answerCallbackQuery', token, { callback_query_id: cbq.id }).catch(() => {});
 
     const student = userStudents.get(chatId);
     if (!student && data !== 'menu_back') {
@@ -438,6 +460,8 @@ async function handleUpdate(centerId, token, update) {
       return;
     }
 
+    touch(chatId);
+
     switch (data) {
       case 'menu_back':
         userStates.set(chatId, 'menu');
@@ -447,23 +471,23 @@ async function handleUpdate(centerId, token, update) {
         );
         break;
       case 'menu_profile':
-        await editMsg(token, chatId, msgId, `⏳ Yuklanmoqda...`, null);
+        await editMsg(token, chatId, msgId, '⏳ Yuklanmoqda...', null);
         await showProfile(centerId, token, chatId, student);
         break;
       case 'menu_groups':
-        await editMsg(token, chatId, msgId, `⏳ Yuklanmoqda...`, null);
+        await editMsg(token, chatId, msgId, '⏳ Yuklanmoqda...', null);
         await showGroups(centerId, token, chatId, student);
         break;
       case 'menu_attendance':
-        await editMsg(token, chatId, msgId, `⏳ Yuklanmoqda...`, null);
+        await editMsg(token, chatId, msgId, '⏳ Yuklanmoqda...', null);
         await showAttendance(centerId, token, chatId, student);
         break;
       case 'menu_payments':
-        await editMsg(token, chatId, msgId, `⏳ Yuklanmoqda...`, null);
+        await editMsg(token, chatId, msgId, '⏳ Yuklanmoqda...', null);
         await showPayments(centerId, token, chatId, student);
         break;
       case 'menu_grades':
-        await editMsg(token, chatId, msgId, `⏳ Yuklanmoqda...`, null);
+        await editMsg(token, chatId, msgId, '⏳ Yuklanmoqda...', null);
         await showGrades(centerId, token, chatId, student);
         break;
       case 'menu_contact':
@@ -479,7 +503,6 @@ async function handleUpdate(centerId, token, update) {
     return;
   }
 
-  // ── Handle regular messages ──
   if (!msg) return;
   const chatId = msg.chat.id;
   const from = msg.from || {};
@@ -487,27 +510,23 @@ async function handleUpdate(centerId, token, update) {
   const contact = msg.contact;
   const state = userStates.get(chatId);
 
-  log('info', `[Center ${centerId}] Chat ${chatId} state=${state || 'none'} text=${text || '(contact)'}`);
+  touch(chatId);
 
-  // Forward message to backend for inbox (except passwords)
+  // Forward message to backend for inbox (fire-and-forget, except passwords)
   if (state !== 'auth_password') {
-    try {
-      await be(centerId, '/incoming', {
-        chat_id: chatId, text: text || (contact ? contact.phone_number : ''),
-        first_name: from.first_name || '',
-        last_name: from.last_name || '',
-        username: from.username || '',
-      });
-    } catch {}
+    be(centerId, '/incoming', {
+      chat_id: chatId, text: text || (contact ? contact.phone_number : ''),
+      first_name: from.first_name || '',
+      last_name: from.last_name || '',
+      username: from.username || '',
+    }).catch(() => {});
   }
 
-  // /start or /menu
   if (text === '/start' || text === '/menu' || text.startsWith('/start ')) {
     await handleStart(centerId, token, chatId, from);
     return;
   }
 
-  // Auth states
   if (state === 'auth_phone') {
     const phone = contact ? contact.phone_number : text;
     await handleAuthPhone(centerId, token, chatId, phone, from);
@@ -519,7 +538,6 @@ async function handleUpdate(centerId, token, update) {
     return;
   }
 
-  // Contact admin mode
   if (state === 'contact') {
     const student = userStudents.get(chatId);
     if (student) {
@@ -528,7 +546,6 @@ async function handleUpdate(centerId, token, update) {
     return;
   }
 
-  // Menu state - route by text
   if (state === 'menu') {
     const student = userStudents.get(chatId);
     if (student) {
@@ -558,87 +575,119 @@ async function handleUpdate(centerId, token, update) {
           );
           break;
         default:
-          await sendMsg(token, chatId,
-            `Quyidagi bo'limlardan birini tanlang:`,
-            mainMenuKb()
-          );
+          await sendMsg(token, chatId, 'Quyidagi bo\'limlardan birini tanlang:', mainMenuKb());
       }
     }
     return;
   }
 
-  // No state - start
-  await sendMsg(token, chatId,
-    `Botdan foydalanish uchun /start bosing.`,
-    removeKb()
-  );
+  await sendMsg(token, chatId, 'Botdan foydalanish uchun /start bosing.', removeKb());
 }
 
-// ─── Polling ──────────────────────────────────────────────
-async function pollBot(centerId, token) {
-  const botInfo = bots.get(centerId);
-  if (!botInfo) return;
+// Polling
+async function pollBotForever(centerId, token) {
+  const entry = bots.get(centerId);
+  if (!entry) return;
 
-  try {
-    const params = new URLSearchParams({
-      offset: String(botInfo.lastOffset),
-      timeout: '30',
-      allowed_updates: 'message,callback_query',
-    });
-    const res = await axios.get(`https://api.telegram.org/bot${token}/getUpdates?${params}`, { timeout: 35000 });
-    const updates = res.data.result || [];
+  let offset = 0;
+  while (entry.running) {
+    try {
+      const params = `offset=${offset}&timeout=30&allowed_updates=message,callback_query`;
+      const res = await tgApi.get(`https://api.telegram.org/bot${token}/getUpdates?${params}`, { timeout: POLL_TIMEOUT });
+      const updates = res.data.result || [];
 
-    for (const update of updates) {
-      botInfo.lastOffset = update.update_id + 1;
-      await handleUpdate(centerId, token, update);
-    }
-  } catch (err) {
-    if (err.response?.status === 401) {
-      log('error', `[Center ${centerId}] Invalid token`);
-      bots.delete(centerId);
-      return;
-    }
-    if (err.response?.status === 409) {
-      log('warn', `[Center ${centerId}] Conflict: ${err.response.data?.description || ''}`);
-      return;
-    }
-    if (err.code !== 'ECONNABORTED') {
-      log('error', `[Center ${centerId}] Poll: ${err.message}`);
+      for (const update of updates) {
+        offset = update.update_id + 1;
+        await handleUpdate(centerId, token, update);
+      }
+    } catch (err) {
+      if (err.response?.status === 401) {
+        log('error', `[${centerId}] Invalid token, stopping`);
+        entry.running = false;
+        return;
+      }
+      if (err.response?.status === 409) {
+        continue;
+      }
+      if (err.code !== 'ECONNABORTED') {
+        log('error', `[${centerId}] Poll: ${err.message}`);
+      }
     }
   }
 }
 
-async function mainLoop() {
-  const configs = await fetchActiveBots();
+function startBotPolling(centerId, token) {
+  if (bots.has(centerId)) {
+    bots.get(centerId).running = false;
+  }
+  const entry = { token, running: true };
+  bots.set(centerId, entry);
+  pollBotForever(centerId, token).catch(err => {
+    log('error', `[${centerId}] Poll loop crashed: ${err.message}`);
+  });
+}
 
-  for (const cfg of configs) {
-    if (!bots.has(cfg.center_id)) {
-      log('info', `Starting bot for center ${cfg.center_id}`);
-      bots.set(cfg.center_id, { token: cfg.bot_token, lastOffset: 0 });
+function stopBotPolling(centerId) {
+  const entry = bots.get(centerId);
+  if (entry) {
+    entry.running = false;
+    bots.delete(centerId);
+  }
+}
+
+function syncConfigs() {
+  const cfgMap = new Map(activeConfigs.map(c => [c.center_id, c.bot_token]));
+
+  // Start new bots
+  for (const [centerId, token] of cfgMap) {
+    if (!bots.has(centerId)) {
+      log('info', `Starting bot for center ${centerId}`);
+      startBotPolling(centerId, token);
     }
   }
 
+  // Stop removed bots
   for (const [centerId] of bots) {
-    if (!configs.find(c => c.center_id === centerId)) {
+    if (!cfgMap.has(centerId)) {
       log('info', `Stopping bot for center ${centerId}`);
-      bots.delete(centerId);
+      stopBotPolling(centerId);
     }
   }
-
-  const promises = [];
-  for (const [centerId, botInfo] of bots) {
-    promises.push(pollBot(centerId, botInfo.token));
-  }
-  await Promise.allSettled(promises);
-
-  setTimeout(mainLoop, POLL_INTERVAL);
 }
 
-// ─── Shutdown ─────────────────────────────────────────────
+function cleanupStaleState() {
+  const stale = Date.now() - STALE_THRESHOLD_MS;
+  for (const [chatId, time] of lastActivity) {
+    if (time < stale) {
+      userStates.delete(chatId);
+      userPhones.delete(chatId);
+      userStudents.delete(chatId);
+      passwordFails.delete(chatId);
+      lastActivity.delete(chatId);
+    }
+  }
+}
+
+async function run() {
+  log('info', 'Ilmify Telegram bot starting...');
+
+  await refreshConfigs();
+  syncConfigs();
+
+  // Refresh configs periodically
+  setInterval(async () => {
+    await refreshConfigs();
+    syncConfigs();
+  }, CONFIG_REFRESH_MS);
+
+  // Cleanup stale state periodically
+  setInterval(cleanupStaleState, STATE_CLEANUP_MS);
+}
+
+// Shutdown
 process.on('SIGINT', () => { log('info', 'Shutting down...'); process.exit(0); });
 process.on('SIGTERM', () => { log('info', 'Shutting down...'); process.exit(0); });
 process.on('uncaughtException', (err) => { log('error', `Uncaught: ${err.message}`); });
-process.on('unhandledRejection', (err) => { log('error', `Unhandled: ${err.message}`) });
+process.on('unhandledRejection', (err) => { log('error', `Unhandled: ${err.message}`); });
 
-log('info', 'Ilmify Telegram bot starting...');
-mainLoop();
+run();
